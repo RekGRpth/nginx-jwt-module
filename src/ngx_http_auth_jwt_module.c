@@ -294,10 +294,16 @@ static char * ngx_http_auth_jwt_merge_loc_conf(ngx_conf_t *cf, void *parent, voi
   ngx_http_auth_jwt_loc_conf_t *prev = parent;
   ngx_http_auth_jwt_loc_conf_t *conf = child;
 
-  ngx_conf_merge_str_value(conf->jwt_key, prev->jwt_key, "");
+  ngx_conf_merge_str_value(conf->jwt_key, prev->jwt_key, NULL);
   ngx_conf_merge_value(conf->jwt_var_index, prev->jwt_var_index, NGX_CONF_UNSET);
   ngx_conf_merge_value(conf->jwt_flag, prev->jwt_flag, NGX_HTTP_AUTH_JWT_OFF);
   ngx_conf_merge_uint_value(conf->jwt_algorithm, prev->jwt_algorithm, JWT_ALG_ANY);
+
+  // If auth_jwt is active, we must have a key
+  if (conf->jwt_flag != NGX_HTTP_AUTH_JWT_OFF && conf->jwt_key.data == NULL) {
+    ngx_conf_log_error(NGX_LOG_ERR, cf, 0, "JWT: key not set");
+    return NGX_CONF_ERROR;
+  }
 
   return NGX_CONF_OK;
 }
@@ -467,9 +473,7 @@ static char * ngx_conf_set_auth_jwt_key(ngx_conf_t *cf, ngx_command_t *cmd, void
 static char * ngx_conf_set_auth_jwt(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
   ngx_http_auth_jwt_loc_conf_t *ajcf = conf;
-
   ngx_int_t *flag = &ajcf->jwt_flag;
-  ngx_int_t *index = &ajcf->jwt_var_index;
 
   if (*flag != NGX_CONF_UNSET)
   {
@@ -478,7 +482,7 @@ static char * ngx_conf_set_auth_jwt(ngx_conf_t *cf, ngx_command_t *cmd, void *co
 
   const ngx_str_t *value = cf->args->elts;
 
-  const ngx_str_t var = value[1];
+  const ngx_str_t var = value[1]; // on | off | $variable
 
   if (var.len == 0)
   {
@@ -508,11 +512,10 @@ static char * ngx_conf_set_auth_jwt(ngx_conf_t *cf, ngx_command_t *cmd, void *co
     }
 
     ngx_str_t str = { .data = var.data + 1, .len = var.len - 1 };
-
-    *index = ngx_http_get_variable_index(cf, &str);
-    if (*index == NGX_ERROR)
+    ajcf->jwt_var_index = ngx_http_get_variable_index(cf, &str);
+    if (ajcf->jwt_var_index == NGX_ERROR)
     {
-      ngx_conf_log_error(NGX_LOG_ERR, cf, 0, "JWT: Can get index for {data: %s, len: %d}", var.data, var.len);
+      ngx_conf_log_error(NGX_LOG_ERR, cf, 0, "JWT: Cannot get index for variable %s", var.data);
       return NGX_CONF_ERROR;
     }
   }
