@@ -75,25 +75,14 @@ The `file` option requires the *value* to be a valid file path (pointing to a PE
 
 Specifies which algorithm the server expects to receive in the JWT.
 
+
 ### Embedded Variables:
+The ngx_http_auth_jwt_module module supports embedded variables:
+- $jwt_header_*name* returns the specified header value
+- $jwt_claim_*name* returns the specified claim value
+- $jwt_headers returns headers
+- $jwt_payload returns payload
 
-Module supports embedded variables:
-
-    $jwt_header
-
-returns whole header
-
-    $jwt_grant
-
-returns whole grant
-
-    $jwt_header_name
-
-returns header.name
-
-    $jwt_grant_name
-
-returns grant.name
 
 ### Image:
 Image is generated with Github Actions (see [nginx-jwt-module:latest][github-container-url])
