@@ -47,6 +47,8 @@ static ngx_int_t ngx_http_auth_jwt_variable(ngx_http_request_t *r, ngx_http_vari
 static ngx_int_t auth_jwt_get_token(u_char **token, ngx_http_request_t *r, const ngx_http_auth_jwt_loc_conf_t *conf);
 static char * auth_jwt_key_from_file(ngx_conf_t *cf, const char *path, ngx_str_t *key);
 static u_char * auth_jwt_safe_string(ngx_pool_t *pool, u_char *src, size_t len);
+static ngx_uint_t auth_jwt_key_is_pem(const ngx_str_t *key);
+static ngx_uint_t auth_jwt_alg_is_hmac(jwt_alg_t alg);
 
 // Configuration functions
 static ngx_int_t ngx_http_auth_jwt_add_variables(ngx_conf_t *cf);
@@ -188,6 +190,18 @@ static ngx_int_t ngx_http_auth_jwt_variable_handler(ngx_http_request_t *r)
     return NGX_DECLINED;
   }
 
+  // A PEM key is meant to be used with an asymmetric algorithm, and its public
+  // half is not a secret: signing a token with it as an HMAC secret would let
+  // anybody forge a valid jwt. Unlike the auth_jwt_alg policy, checked in the
+  // access handler, this one is done here so that a forged jwt never reaches
+  // the module context, hence never feeds the $jwt_* variables.
+  if (auth_jwt_key_is_pem(&conf->jwt_key) && auth_jwt_alg_is_hmac(jwt_get_alg(jwt)))
+  {
+    ngx_log_error(NGX_LOG_WARN, r->connection->log, 0, "JWT: %s algorithm cannot be used with a PEM key", jwt_alg_str(jwt_get_alg(jwt)));
+    jwt_free(jwt);
+    return NGX_DECLINED;
+  }
+
   // jwt_decode succeeded and allocated an jwt object.
   // We register jwt_free as a function to be called on pool cleanup.
   ngx_pool_cleanup_t *cln = ngx_pool_cleanup_add(r->pool, 0);
@@ -252,10 +266,13 @@ static ngx_int_t ngx_http_auth_jwt_access_handler(ngx_http_request_t *r)
     if (exp == 0)
     {
       ngx_log_error(NGX_LOG_WARN, r->connection->log, 0, "JWT: invalid exp date in jwt %s", exp_str);
+      jwt_free_str(exp_str);
       return NGX_HTTP_UNAUTHORIZED;
     }
 
-    if (exp < time(NULL))
+    jwt_free_str(exp_str);
+
+    if (exp < ngx_time())
     {
       ngx_log_error(NGX_LOG_INFO, r->connection->log, 0, "JWT: the jwt has expired [exp=%ld]", (long)exp);
       return NGX_HTTP_UNAUTHORIZED;
@@ -391,19 +408,32 @@ static char * auth_jwt_key_from_file(ngx_conf_t *cf, const char *path, ngx_str_t
   struct stat fstat;
   if (stat(path, &fstat) < 0)
   {
-    ngx_conf_log_error(NGX_LOG_ERR, cf, errno, strerror(errno));
+    ngx_conf_log_error(NGX_LOG_ERR, cf, errno, "JWT: stat() \"%s\" failed", path);
+    return NGX_CONF_ERROR;
+  }
+
+  // An empty file would silently give an empty key
+  if (fstat.st_size == 0)
+  {
+    ngx_conf_log_error(NGX_LOG_ERR, cf, 0, "JWT: key file \"%s\" is empty", path);
     return NGX_CONF_ERROR;
   }
 
   FILE *fp = fopen(path, "rb");
   if (fp == NULL)
   {
-    ngx_conf_log_error(NGX_LOG_ERR, cf, errno, strerror(errno));
+    ngx_conf_log_error(NGX_LOG_ERR, cf, errno, "JWT: fopen() \"%s\" failed", path);
     return NGX_CONF_ERROR;
   }
 
   key->len = fstat.st_size;
   key->data = ngx_pcalloc(cf->pool, key->len);
+
+  if (key->data == NULL)
+  {
+    fclose(fp);
+    return NGX_CONF_ERROR;
+  }
 
   if (fread(key->data, 1, key->len, fp) != key->len)
   {
@@ -519,6 +549,12 @@ static char * ngx_conf_set_auth_jwt_key(ngx_conf_t *cf, ngx_command_t *cmd, void
     if (ngx_strcmp(value[2].data, "file") == 0)
     {
       const char *path = (char *)auth_jwt_safe_string(cf->pool, value[1].data, value[1].len);
+
+      if (path == NULL)
+      {
+        return NGX_CONF_ERROR;
+      }
+
       return auth_jwt_key_from_file(cf, path, key);
     }
     else if (ngx_strcmp(value[2].data, "hex") == 0)
@@ -565,6 +601,11 @@ static char * ngx_conf_set_auth_jwt_key(ngx_conf_t *cf, ngx_command_t *cmd, void
       key->data = ngx_palloc(cf->pool, keystr->len / 2);
       key->len = keystr->len / 2;
 
+      if (key->data == NULL)
+      {
+        return NGX_CONF_ERROR;
+      }
+
       if (hex_to_binary(key->data, keystr->data, keystr->len) != NGX_OK)
       {
         ngx_conf_log_error(NGX_LOG_ERR, cf, 0, "JWT: Failed to turn hex key into binary");
@@ -577,6 +618,11 @@ static char * ngx_conf_set_auth_jwt_key(ngx_conf_t *cf, ngx_command_t *cmd, void
     {
       key->len = ngx_base64_decoded_length(keystr->len);
       key->data = ngx_palloc(cf->pool, key->len);
+
+      if (key->data == NULL)
+      {
+        return NGX_CONF_ERROR;
+      }
 
       if (ngx_decode_base64(key, keystr) != NGX_OK)
       {
@@ -673,6 +719,22 @@ static u_char * auth_jwt_safe_string(ngx_pool_t *pool, u_char *src, size_t len)
 }
 
 
+// Tell whether a key holds a PEM block (public key, private key, certificate...)
+static ngx_uint_t auth_jwt_key_is_pem(const ngx_str_t *key)
+{
+  static const ngx_str_t pem_prefix = ngx_string("-----BEGIN");
+
+  return key->len > pem_prefix.len && ngx_strncmp(key->data, pem_prefix.data, pem_prefix.len) == 0;
+}
+
+
+// Tell whether an algorithm signs with a shared secret rather than a key pair
+static ngx_uint_t auth_jwt_alg_is_hmac(jwt_alg_t alg)
+{
+  return alg == JWT_ALG_HS256 || alg == JWT_ALG_HS384 || alg == JWT_ALG_HS512;
+}
+
+
 static ngx_int_t auth_jwt_get_token(u_char **token, ngx_http_request_t *r, const ngx_http_auth_jwt_loc_conf_t *conf)
 {
   static const ngx_str_t bearer = ngx_string("Bearer ");
@@ -720,9 +782,9 @@ static ngx_int_t auth_jwt_get_token(u_char **token, ngx_http_request_t *r, const
     return NGX_ERROR;
   }
 
-  if (token == NULL)
+  if (*token == NULL)
   {
-    ngx_log_error(NGX_LOG_WARN, r->connection->log, 0, "Could not allocate memory.");
+    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "JWT: could not allocate memory");
     return NGX_ERROR;
   }
 
@@ -757,7 +819,7 @@ static ngx_int_t ngx_http_auth_jwt_variable(ngx_http_request_t *r, ngx_http_vari
     return NGX_OK;
   }
 
-  const char *value = NULL;
+  char *value = NULL;
 
   switch (data)
   {
@@ -784,6 +846,13 @@ static ngx_int_t ngx_http_auth_jwt_variable(ngx_http_request_t *r, ngx_http_vari
       // Value without prefix and null terminated
       const char *val = (char *)auth_jwt_safe_string(r->pool, name->data + plen, name->len - plen);
 
+      // libjwt returns every header or claim when asked for a NULL one,
+      // so we must not let a failed allocation widen what we expose here.
+      if (val == NULL) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "JWT: could not allocate memory");
+        return NGX_ERROR;
+      }
+
       value = h ? jwt_get_headers_json(jwt, val) : jwt_get_grants_json(jwt, val);
     }
   }
@@ -792,8 +861,18 @@ static ngx_int_t ngx_http_auth_jwt_variable(ngx_http_request_t *r, ngx_http_vari
     return NGX_OK;
   }
 
-  v->data = (u_char *) value;
-  v->len = ngx_strlen(value);
+  const size_t len = ngx_strlen(value);
+  u_char *copy = auth_jwt_safe_string(r->pool, (u_char *) value, len);
+
+  jwt_free_str(value);
+
+  if (copy == NULL) {
+    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "JWT: could not allocate memory");
+    return NGX_ERROR;
+  }
+
+  v->data = copy;
+  v->len = len;
   v->valid = 1;
   v->no_cacheable = 0;
   v->not_found = 0;

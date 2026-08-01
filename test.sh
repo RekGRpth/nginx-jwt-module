@@ -64,6 +64,7 @@ fi
 
 b64enc() { openssl enc -base64 -A | tr '+/' '-_' | tr -d '='; }
 hs_sign() { openssl dgst -binary -sha"${1}" -hmac "$2"; }
+hs_sign_hex() { openssl dgst -binary -sha"${1}" -mac HMAC -macopt hexkey:"$2"; }
 rs_sign() { openssl dgst -binary -sha"${1}" -sign <(printf '%s\n' "$2"); }
 
 make_jwt() {
@@ -78,12 +79,27 @@ make_jwt() {
   return 0
 }
 
+# Sign a jwt with the raw content of a key file used as an hmac secret.
+# The secret is passed as hex so that it matches the file byte for byte.
+make_hmac_jwt() {
+  local alg=$1
+  local key=$2
+  local alg_size=${alg#HS} # alg without HS prefix
+  local header=`echo -n "{\"alg\":\"$alg\"}" | b64enc`
+  local payload=`echo -n '{}' | b64enc`
+  local secret=`od -An -v -tx1 ./test-image/nginx/keys/$key | tr -d ' \n'`
+  local sig=`echo -n "$header.$payload" | hs_sign_hex "$alg_size" "$secret" | b64enc`
+  echo -n "$header.$payload.$sig"
+  return 0
+}
+
 # Disable exit on error
 set +e
 
 VALID_RS256=`make_jwt RS256 rsa-private.pem`
 VALID_RS512=`make_jwt RS512 rsa-private.pem`
 BAD_RS256=`make_jwt RS256 rsa-wrong-private.pem`
+FORGED_HS256=`make_hmac_jwt HS256 rsa-public.pem` # public key used as an hmac secret
 VALID_JWT="eyJhbGciOiJIUzI1NiJ9.e30.-gVyhFDs5NeX0yvaAoTPVgrDfrg_qk7dF0sNj_-Bu-c" # secret = 'inherited-secret' (utf8)
 BAD_SIG="eyJhbGciOiJIUzI1NiJ9.e30.nmwH1lIcnA-g8CEV_fWIlAV7h98_Wwy1gIqIabAdrIs" # secret = 'invalid' (utf8)
 
@@ -158,9 +174,9 @@ test_conf_local () {
 
 test_conf () {
   if [[ "$USE_CURRENT" == "2" ]]; then
-    test_conf_local $@
+    test_conf_local "$@"
   else
-    test_conf_docker $@
+    test_conf_docker "$@"
   fi
 }
 
@@ -235,6 +251,12 @@ test_jwt "Valid jwt header with expected alg (RS512)" "/rsa-file-encoded-alg-512
 test_jwt "Valid jwt header but bad alg (RS512 instead of RS256)" "/rsa-file-encoded-alg-256/" "401" "--header \"Authorization: Bearer ${VALID_RS512}\""
 test_jwt "Valid jwt header but bad alg (RS256 instead of RS512)" "/rsa-file-encoded-alg-512/" "401" "--header \"Authorization: Bearer ${VALID_RS256}\""
 
+echo "# Test algorithm confusion"
+test_jwt "Calling rsa-file-encoded with a jwt signed with the public key should return 401" "/rsa-file-encoded" "401" "--header \"Authorization: Bearer ${FORGED_HS256}\""
+test_jwt "Calling any-alg with a jwt signed with the public key should return 401" "/any-alg" "401" "--header \"Authorization: Bearer ${FORGED_HS256}\""
+JWT='eyJhbGciOiJIUzI1NiJ9.e30.XmNK3GpH3Ys_7wsYBfq4C3M6goz71I7dTgUkuIa5lyQ' # secret = 'secret' (utf8)
+test_jwt "Calling hmac-file-encoded with a valid jwt should return 201" "/hmac-file-encoded" "201" "--header \"Authorization: Bearer ${JWT}\""
+
 echo "# Test any alg"
 test_jwt "Calling any-alg with RS256 alg should return 201" "/any-alg" "201" "--header \"Authorization: Bearer ${VALID_RS256}\""
 test_jwt "Calling any-alg with RS512 alg should return 201" "/any-alg" "201" "--header \"Authorization: Bearer ${VALID_RS512}\""
@@ -265,19 +287,20 @@ if [[ "$USE_CURRENT" == "1" ]] && [[ "$DOCKER_CONTAINER_NAME" == "0" ]]; then
   echo -e "${YELLOW}Warning: container identifier not set -> skipping configuration tests${NONE}"
 else
   echo "# Test configurations"
-  test_conf 'invalid-nginx-1' '"auth_jwt_key" directive is duplicate in /etc/nginx/invalid-nginx.conf:18'
+  test_conf 'invalid-nginx-1' '"auth_jwt_key" directive is duplicate in /etc/nginx/invalid-nginx-1.conf:18'
   test_conf 'invalid-nginx-2' 'JWT: key not set in /etc/nginx/invalid-nginx-2.conf:10'
   test_conf 'invalid-arg-1' 'invalid number of arguments in "auth_jwt" directive in /etc/nginx/invalid-arg-1.conf:6'
   test_conf 'invalid-arg-2' 'invalid number of arguments in "auth_jwt_key" directive in /etc/nginx/invalid-arg-2.conf:5'
   test_conf 'invalid-arg-3' 'Invalid key in /etc/nginx/invalid-arg-3.conf:5'
-  test_conf 'invalid-arg-4' 'No such file or directory (2: No such file or directory) in /etc/nginx/invalid-arg-4.conf:5'
-  test_conf 'invalid-arg-5' 'No such file or directory (2: No such file or directory) in /etc/nginx/invalid-arg-5.conf:5'
+  test_conf 'invalid-arg-4' 'JWT: stat() "" failed (2: No such file or directory) in /etc/nginx/invalid-arg-4.conf:5'
+  test_conf 'invalid-arg-5' 'JWT: stat() "invalid-path" failed (2: No such file or directory) in /etc/nginx/invalid-arg-5.conf:5'
+  test_conf 'invalid-arg-6' 'JWT: key file "/etc/nginx/keys/empty-secret.txt" is empty in /etc/nginx/invalid-arg-6.conf:5'
   test_conf 'invalid-key-1' 'Failed to turn hex key into binary in /etc/nginx/invalid-key-1.conf:5'
   test_conf 'invalid-key-2' 'Failed to turn base64 key into binary in /etc/nginx/invalid-key-2.conf:5'
   test_conf 'invalid-require-1' 'invalid error code 402 in /etc/nginx/invalid-require-1.conf:17'
   test_conf 'invalid-require-2' 'error=403 cannot be the single element of jwt_auth_require directive in /etc/nginx/invalid-require-2.conf:17'
   test_conf 'invalid-require-3' 'error=401 must be the last element of jwt_auth_require directive in /etc/nginx/invalid-require-3.conf:17'
-  test_conf 'invalid-require-4' 'invalid variable name "admin=true" in /etc/nginx/invalid-require-6.conf:13'
+  test_conf 'invalid-require-4' 'invalid variable name "admin=true" in /etc/nginx/invalid-require-4.conf:13'
   test_conf 'invalid-require-5' 'unknown "jwt_has_admin_role" variable'
   test_conf 'invalid-require-6' '"auth_jwt_require" directive is duplicate in /etc/nginx/invalid-require-6.conf:23'
 fi
